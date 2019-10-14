@@ -68,7 +68,7 @@ public class AknnRestAction extends BaseRestHandler {
     @Inject
     public AknnRestAction(Settings settings, RestController controller) {
         super(settings);
-        controller.registerHandler(GET, "/{index}/{type}/{id}/" + NAME_SEARCH, this);
+        controller.registerHandler(GET, "/{index}/{type}/" + NAME_SEARCH, this);
         controller.registerHandler(POST, NAME_INDEX, this);
         controller.registerHandler(POST, NAME_CREATE, this);
     }
@@ -100,29 +100,51 @@ public class AknnRestAction extends BaseRestHandler {
         StopWatch stopWatch = new StopWatch("StopWatch to Time Search Request");
 
         // Parse request parameters.
-        stopWatch.start("Parse request parameters");
+        logger.info("Parse search request parameters");
+        stopWatch.start("Parse search request parameters");
+        XContentParser xContentParser = XContentHelper.createParser(
+                restRequest.getXContentRegistry(), restRequest.content(), restRequest.getXContentType());
+        Map<String, Object> contentMap = xContentParser.mapOrdered();
+        @SuppressWarnings("unchecked")
+        List<Double> queryVector = (List<Double>) contentMap.get("_query_vector");
+        final String aknnURI = (String) contentMap.get("_aknn_uri");
         final String index = restRequest.param("index");
         final String type = restRequest.param("type");
-        final String id = restRequest.param("id");
         final Integer k1 = restRequest.paramAsInt("k1", K1_DEFAULT);
         final Integer k2 = restRequest.paramAsInt("k2", K2_DEFAULT);
         stopWatch.stop();
 
-        logger.info("Get query document at {}/{}/{}", index, type, id);
-        stopWatch.start("Get query document");
-        GetResponse queryGetResponse = client.prepareGet(index, type, id).get();
-        Map<String, Object> baseSource = queryGetResponse.getSource();
-        stopWatch.stop();
+        // Check if the LshModel has been cached. If not, retrieve the Aknn document and use it to populate the model.
+        LshModel lshModel;
+        if (! lshModelCache.containsKey(aknnURI)) {
 
-        logger.info("Parse query document hashes");
-        stopWatch.start("Parse query document hashes");
-        @SuppressWarnings("unchecked")
-        Map<String, Long> queryHashes = (Map<String, Long>) baseSource.get(HASHES_KEY);
-        stopWatch.stop();
+            // Get the Aknn document.
+            logger.info("Get Aknn model document from {}", aknnURI);
+            stopWatch.start("Get Aknn model document");
+            String[] annURITokens = aknnURI.split("/");
+            GetResponse aknnGetResponse = client.prepareGet(annURITokens[0], annURITokens[1], annURITokens[2]).get();
+            stopWatch.stop();
 
-        stopWatch.start("Parse query document vector");
-        @SuppressWarnings("unchecked")
-        List<Double> queryVector = (List<Double>) baseSource.get(VECTOR_KEY);
+            // Instantiate LSH from the source map.
+            logger.info("Parse Aknn model document");
+            stopWatch.start("Parse Aknn model document");
+            lshModel = LshModel.fromMap(aknnGetResponse.getSourceAsMap());
+            stopWatch.stop();
+
+            // Save for later.
+            lshModelCache.put(aknnURI, lshModel);
+
+        } else {
+            logger.info("Get Aknn model document from local cache");
+            stopWatch.start("Get Aknn model document from local cache");
+            lshModel = lshModelCache.get(aknnURI);
+            stopWatch.stop();
+        }
+
+        // Get query vector hashes.
+        logger.info("Get query vector hashes");
+        stopWatch.start("Get query vector hashes");
+        Map<String, Long> queryHashes = lshModel.getVectorHashes(queryVector);
         stopWatch.stop();
 
         // Retrieve the documents with most matching hashes. https://stackoverflow.com/questions/10773581
